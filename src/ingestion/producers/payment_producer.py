@@ -28,6 +28,7 @@ def generate_initial_checkout():
     """Generates a highly realistic payment event using Faker.""" 
     transaction_id = fake.uuid4()
     idempotency_key = fake.uuid4()
+    intent_id = f"intent_{fake.uuid4()}"
     
     origin_time = datetime.now(timezone.utc)
     
@@ -40,11 +41,16 @@ def generate_initial_checkout():
     payload = {
         'transaction_id': transaction_id, 
         'idempotency_key': idempotency_key, 
+        'intent_id': intent_id,
+        'charge_id': None,
+        'refund_id': None,
+        'chargeback_id': None,
+        'retry_attempt': 0,
         
         'merchant_id': merchant_id, 
         'amount': amount, 
         'currency': currency,
-        'user_id': user_id, 
+        'user_id': f'user_{user_id}', 
         'country': random.choice(COUNTRIES),
         
         'source_system': random.choice(SOURCE_SYSTEMS), 
@@ -54,16 +60,16 @@ def generate_initial_checkout():
     }
     
     events_to_emit = []
-    for initial_status in ['payment_intent_created', 'pending']:
-        event_payload = payload.copy()  
-        event_payload['status'] = initial_status
-        event_payload['event_id'] = fake.uuid4()
-        
-        current_time = datetime.now(timezone.utc).isoformat()
-        event_payload['event_timestamp'] = current_time
-        event_payload['ingestion_timestamp'] = current_time
-        events_to_emit.append(event_payload)
-        time.sleep(0.05) # Tiny micro-delay between webhooks
+    created_event = payload.copy()
+    created_event['event_type'] = 'payment_intent_created'
+    created_event['status'] = 'pending'
+    created_event['event_id'] = fake.uuid4()
+
+    current_time = datetime.now(timezone.utc).isoformat()
+    created_event['event_timestamp'] = current_time
+    created_event['ingestion_timestamp'] = current_time
+    events_to_emit.append(created_event)
+    time.sleep(0.05) # Tiny micro-delay between webhooks
     
 
     decision_event = payload.copy()
@@ -73,10 +79,12 @@ def generate_initial_checkout():
     decision_event['ingestion_timestamp'] = current_time
     
     if random.random() < 0.85: # 85% chance of success
+        decision_event['event_type'] = 'payment_intent_authorized'
         decision_event['status'] = 'authorized'
         pending_authorizations[transaction_id] = decision_event # Store for later capture
         
     else:
+        decision_event['event_type'] = 'payment_intent_failed'
         decision_event['status'] = 'failed'
         decision_event['failure_code'] = random.choices(FAILURE_CODES, weights=FAILURE_WEIGHTS, k=1)[0]
         # Failed transactions won't have captures.
@@ -116,17 +124,20 @@ def progress_transaction_to_capture(transaction_id):
     base_payload = pending_authorizations.pop(transaction_id, None) # Remove from pending, move to captured
     if base_payload is None:
         return None
-    captured_transactions[transaction_id] = base_payload # Store in captured for potential refunds/chargebacks
-    
     # Clone base payload but update the state
     capture_payload = base_payload.copy()
     capture_payload["event_id"] = fake.uuid4() # New Kafka event ID
+    capture_payload["event_type"] = "capture_succeeded"
     capture_payload["status"] = "captured"
+    capture_payload["charge_id"] = f"charge_{fake.uuid4()}"
     
     # Simulate processing delay (event happened 2 seconds ago, ingested now)
     event_time = datetime.now(timezone.utc) - timedelta(seconds=random.randint(1, 5))
     capture_payload['event_timestamp'] = event_time.isoformat()
     capture_payload["ingestion_timestamp"] = datetime.now(timezone.utc).isoformat()
+
+    # Store captured payload for potential refunds/chargebacks.
+    captured_transactions[transaction_id] = capture_payload
     
     
     return capture_payload
@@ -140,7 +151,7 @@ def generate_late_lifecycle_event():
     base_payload = captured_transactions[transaction_id]
     
     # Decide if this is a settlement, refund, or chargeback
-    event_type = random.choices(['settled', 'refund', 'chargeback'], weights=[0.70, 0.25, 0.05])[0]
+    lifecycle_kind = random.choices(['settled', 'refund', 'chargeback'], weights=[0.70, 0.25, 0.05])[0]
     
     late_event_payload = base_payload.copy()
     late_event_payload['event_id'] = fake.uuid4()
@@ -150,17 +161,22 @@ def generate_late_lifecycle_event():
     historical_time = datetime.now(timezone.utc) - timedelta(days=days_late)
     late_event_payload['event_timestamp'] = historical_time.isoformat()
     late_event_payload['ingestion_timestamp'] = datetime.now(timezone.utc).isoformat()
-    if event_type == 'settled':
+    if lifecycle_kind == 'settled':
+        late_event_payload['event_type'] = 'settlement_recorded'
         late_event_payload['status'] = 'settled'
         # Once settled, we can remove from captured as it's fully complete
         captured_transactions.pop(transaction_id)
         
-    elif event_type == 'refund':
+    elif lifecycle_kind == 'refund':
+        late_event_payload['event_type'] = 'refund_recorded'
         late_event_payload['status'] = 'refunded'
+        late_event_payload['refund_id'] = f"refund_{fake.uuid4()}"
         # Refunds can still be charged back later, so we keep it in captured for now
         
     else: # Chargeback
+        late_event_payload['event_type'] = 'chargeback_received'
         late_event_payload['status'] = 'chargeback'
+        late_event_payload['chargeback_id'] = f"chargeback_{fake.uuid4()}"
         # Chargebacks are final, remove from captured
         captured_transactions.pop(transaction_id)
     
