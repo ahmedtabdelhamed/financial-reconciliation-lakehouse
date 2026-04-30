@@ -1,0 +1,127 @@
+name: financial-reconciliation-lakehouse
+
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: lakehouse-postgres
+    restart: unless-stopped
+    ports:
+      - 5432:5432
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-operational_db}
+      TZ: ${TZ:-UTC}
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-operational_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    networks:
+      - lakehouse_net
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+    command: ["postgres", "-c", "wal_level=logical"]  
+
+
+  kafka:
+    image: quay.io/debezium/kafka:3.2
+    container_name: lakehouse-kafka
+    restart: unless-stopped
+    ports: 
+      - 9092:9092
+      - 9093:9093
+
+    environment:
+      - CLUSTER_ID=${KAFKA_CLUSTER_ID:-oh-sxaDRTcyAr6pFRbXyzA}
+      - NODE_ID=${KAFKA_NODE_ID:-1}
+      - NODE_ROLE=${KAFKA_NODE_ROLE:-combined}
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=${KAFKA_CONTROLLER_QUORUM_VOTERS:-1@kafka:9093}
+      
+      - KAFKA_LISTENERS=${KAFKA_LISTENERS:-INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093}
+      - KAFKA_ADVERTISED_LISTENERS=${KAFKA_ADVERTISED_LISTENERS:-INTERNAL://kafka:29092,EXTERNAL://localhost:9092}
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=${KAFKA_LISTENER_SECURITY_PROTOCOL_MAP:-INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT}
+      - KAFKA_INTER_BROKER_LISTENER_NAME=${KAFKA_INTER_BROKER_LISTENER_NAME:-INTERNAL}
+    
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+    networks:
+      - lakehouse_net
+
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  connect:
+    image: quay.io/debezium/connect:3.2
+    container_name: lakehouse-debezium
+    restart: unless-stopped
+    ports:
+      - 8083:8083
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+        
+      postgres:
+        condition: service_healthy
+    
+    networks:
+      - lakehouse_net
+
+    environment:
+      - BOOTSTRAP_SERVERS=${CONNECT_BOOTSTRAP_SERVERS:-kafka:29092}
+      - GROUP_ID=${CONNECT_GROUP_ID:-1}
+      - CONFIG_STORAGE_TOPIC=${CONNECT_CONFIG_STORAGE_TOPIC:-my_connect_configs}
+      - OFFSET_STORAGE_TOPIC=${CONNECT_OFFSET_STORAGE_TOPIC:-my_connect_offsets}
+      - STATUS_STORAGE_TOPIC=${CONNECT_STATUS_STORAGE_TOPIC:-my_connect_statuses}
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/ >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  smoke-test:
+    image: alpine:3.20
+    container_name: lakehouse-smoke-test
+    restart: "no"
+    depends_on:
+      connect:
+        condition: service_healthy
+    networks:
+      - lakehouse_net
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-operational_db}
+      KAFKA_HOST: kafka
+      KAFKA_PORT: 29092
+      CONNECT_URL: http://connect:8083
+    volumes:
+      - ./smoke-test.sh:/smoke-test.sh:ro
+    entrypoint: ["/bin/sh", "/smoke-test.sh"]
+
+volumes:
+  postgres_data:
+  kafka_data:
+
+networks:
+  lakehouse_net:
+    driver: bridge
+    name: lakehouse-network

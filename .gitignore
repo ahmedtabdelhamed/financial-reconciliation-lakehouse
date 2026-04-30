@@ -8,6 +8,9 @@ __pycache__/
 .venv/
 venv/
 
+# Python version managers
+.python-version
+
 # Jupyter
 .ipynb_checkpoints/
 
@@ -17,9 +20,34 @@ venv/
 # macOS
 .DS_Store
 
-# Logs
+# Logs and process files
 *.log
+*.pid
 
-# Local env files
+# Local env and compose overrides
 .env
 .env.*
+!.env.example
+docker-compose.override.yml
+docker/*.override.yml
+
+# Secrets and credentials
+*.key
+*.pem
+*.crt
+*.cer
+*.p12
+*.jks
+*.secret
+*credentials*
+
+# Local/generated data
+data/bronze/
+data/checkpoints/
+data/gold/
+data/logs/
+data/raw/
+data/silver/
+*.db
+*.sqlite
+*.sqlite3
