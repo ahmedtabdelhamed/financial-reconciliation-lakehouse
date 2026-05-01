@@ -117,9 +117,9 @@ CREATE INDEX idx_charges_intent_id ON operational.charges(intent_id);
 CREATE INDEX idx_refunds_charge_id ON operational.refunds(charge_id);
 CREATE INDEX idx_chargebacks_charge_id ON operational.chargebacks(charge_id);
 
-CREATE INDEX idx_payment_status_history_intent_id ON operational.payment_status_history(intent_id);
-CREATE INDEX idx_payment_status_history_charge_id ON operational.payment_status_history(charge_id);
-CREATE INDEX idx_payment_status_history_refund_id ON operational.payment_status_history(refund_id);
+CREATE INDEX idx_payment_status_history_intent_id ON operational.payment_status_history(intent_id) WHERE intent_id IS NOT NULL;
+CREATE INDEX idx_payment_status_history_charge_id ON operational.payment_status_history(charge_id) WHERE charge_id IS NOT NULL;
+CREATE INDEX idx_payment_status_history_refund_id ON operational.payment_status_history(refund_id) WHERE refund_id IS NOT NULL;
 CREATE INDEX idx_payment_status_history_event_ts ON operational.payment_status_history(event_timestamp);
 
 CREATE INDEX idx_raw_payment_events_idempotency_key ON operational.raw_payment_events(idempotency_key);
