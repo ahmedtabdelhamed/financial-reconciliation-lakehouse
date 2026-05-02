@@ -4,7 +4,9 @@ import time
 import random
 from datetime import datetime, timedelta, timezone
 from faker import Faker
-from confluent_kafka import Producer
+from psycopg2 import pool
+from psycopg2.extras import Json
+from dotenv import load_dotenv
 import string
 
 fake = Faker() 
@@ -20,6 +22,16 @@ SOURCE_SYSTEMS = ['stripe_webhook', 'adyen_api', 'paypal_ipn', 'internal_pos']
 FAILURE_CODES = ['insufficient_funds', 'expired_card', 'incorrect_cvc', 'suspected_fraud']
 FAILURE_WEIGHTS = [0.50, 0.25, 0.15, 0.10] # Most failures are just lack of funds
 
+CURRENCY_MINOR_UNITS = {
+    "USD": 2,
+    "EGP": 2,
+    "EUR": 2,
+    "GBP": 2,
+    "JPY": 0,
+    "AUD": 2,
+    "CAD": 2,
+    "CHF": 2,
+}
 
 pending_authorizations = {} # Waiting to be captured
 captured_transactions = {}  # Waiting to be settled or refunded/charged back
@@ -187,39 +199,277 @@ def generate_late_lifecycle_event():
 
     # ______________________________________________________________________________________________________________ 
 
-def create_kafka_producer():
-    return Producer(
-        {
-            "bootstrap.servers": os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
-            "client.id": "financial-reconciliation-payment-producer",
-        }
+def create_db_pool():
+    load_dotenv()
+
+    db_host = os.getenv("POSTGRES_HOST")
+    db_port = int(os.getenv("POSTGRES_PORT", "5432"))
+    db_user = os.getenv("POSTGRES_USER")
+    db_password = os.getenv("POSTGRES_PASSWORD")
+    db_name = os.getenv("POSTGRES_DB")
+    min_conn = int(os.getenv("POSTGRES_POOL_MIN_CONNECTIONS", "1"))
+    max_conn = int(os.getenv("POSTGRES_POOL_MAX_CONNECTIONS", "5"))
+
+    if not all([db_host, db_user, db_password, db_name]):
+        raise ValueError(
+            "Missing required Postgres env vars: "
+            "POSTGRES_HOST, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB"
+        )
+
+    return pool.ThreadedConnectionPool(
+        minconn=min_conn,
+        maxconn=max_conn,
+        user=db_user,
+        password=db_password,
+        host=db_host,
+        port=db_port,
+        database=db_name,
+    )
+    
+    
+    
+    
+def to_amount_minor(amount, currency):
+    scale = CURRENCY_MINOR_UNITS.get(currency, 2)
+    return int(round(amount * (10 ** scale)))
+
+
+def parse_iso_ts(s):
+    """Parse ISO timestamp string to Python datetime or return None."""
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
+        # numeric timestamps not expected; ignore
+        return None
+    try:
+        # Python's fromisoformat handles most ISO formats including offsets
+        return datetime.fromisoformat(s)
+    except Exception:
+        try:
+            # Fallback: try common format without offset
+            return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%f")
+        except Exception:
+            return None
+    
+def upsert_payment_intent(cursor, event):
+    amount_minor = to_amount_minor(event["amount"], event["currency"])
+
+    cursor.execute(
+        """
+        INSERT INTO operational.payment_intents (
+            intent_id, transaction_id, idempotency_key, user_id, merchant_id,
+            amount_minor, currency, status, source_system, created_at, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+        ON CONFLICT (transaction_id, idempotency_key)
+        DO UPDATE SET
+            status = EXCLUDED.status,
+            updated_at = NOW()
+        """,
+        (
+            event.get("intent_id"),
+            event["transaction_id"],
+            event["idempotency_key"],
+            event.get("user_id"),
+            event.get("merchant_id"),
+            amount_minor,
+            event.get("currency"),
+            event.get("status"),
+            event.get("source_system"),
+        ),
     )
 
 
-def emit_event_batch(producer, topic_name, raw_events, p_exact=0.05, p_retry=0.02):
-    """Expand raw events into delivery variants, then publish to Kafka."""
-    published = 0
-    for raw_event in raw_events:
-        outbound_events = get_duplicate_events(raw_event, p_exact=p_exact, p_retry=p_retry)
-        for event in outbound_events:
-            producer.produce(
-                topic=topic_name,
-                key=event["transaction_id"].encode("utf-8"),
-                value=json.dumps(event).encode("utf-8"),
-            )
-            published += 1
+def ensure_user_and_merchant(cursor, event):
+    """Ensure referenced user and merchant exist (idempotent)."""
+    user_id = event.get('user_id')
+    merchant_id = event.get('merchant_id')
+    if user_id:
+        cursor.execute(
+            """
+            INSERT INTO operational.users (user_id, email)
+            VALUES (%s, %s)
+            ON CONFLICT (user_id) DO NOTHING
+            """,
+            (user_id, f"{user_id}@example.com"),
+        )
+    if merchant_id:
+        cursor.execute(
+            """
+            INSERT INTO operational.merchants (merchant_id, merchant_name)
+            VALUES (%s, %s)
+            ON CONFLICT (merchant_id) DO NOTHING
+            """,
+            (merchant_id, merchant_id),
+        )
+    
 
-    producer.poll(0)
-    return published
+
+def upsert_charge(cursor, event):
+    amount_minor = to_amount_minor(event["amount"], event["currency"])
+
+    cursor.execute(
+        """
+        INSERT INTO operational.charges (
+            charge_id, transaction_id, idempotency_key, intent_id,
+            amount_minor, status, currency, payment_method, source_system,
+            created_at, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+        ON CONFLICT (transaction_id, idempotency_key)
+        DO UPDATE SET
+            status = EXCLUDED.status,
+            updated_at = NOW()
+        """,
+        (
+            event.get("charge_id"),
+            event["transaction_id"],
+            event["idempotency_key"],
+            event.get("intent_id"),
+            amount_minor,
+            event.get("status"),
+            event.get("currency"),
+            event.get("payment_method"),
+            event.get("source_system"),
+        ),
+    )
+    
+    
+def upsert_refund(cursor, event):
+    amount_minor = to_amount_minor(event["amount"], event["currency"])
+
+    cursor.execute(
+        """
+        INSERT INTO operational.refunds (
+            refund_id, transaction_id, idempotency_key, charge_id,
+            amount_minor, currency, refund_reason, is_partial, status, source_system,
+            created_at, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+        ON CONFLICT (transaction_id, idempotency_key)
+        DO UPDATE SET
+            status = EXCLUDED.status,
+            updated_at = NOW()
+        """,
+        (
+            event.get("refund_id"),
+            event["transaction_id"],
+            event["idempotency_key"],
+            event.get("charge_id"),
+            amount_minor,
+            event.get("currency"),
+            event.get("refund_reason"),
+            event.get("is_partial", False),
+            event.get("status"),
+            event.get("source_system"),
+        ),
+    )
+    
+    
+def upsert_chargeback(cursor, event):
+    amount_minor = to_amount_minor(event["amount"], event["currency"])
+
+    cursor.execute(
+        """
+        INSERT INTO operational.chargebacks (
+            chargeback_id, charge_id, amount_minor, reason, filed_at, status,
+            created_at, updated_at
+        )
+        VALUES (%s, %s, %s, %s, NOW(), %s, NOW(), NOW())
+        ON CONFLICT (chargeback_id)
+        DO UPDATE SET
+            status = EXCLUDED.status,
+            updated_at = NOW()
+        """,
+        (
+            event.get("chargeback_id"),
+            event.get("charge_id"),
+            amount_minor,
+            event.get("reason"),
+            event.get("status"),
+        ),
+    )
 
 
-def run_kafka_stream():
-    topic_name = os.getenv("PAYMENT_EVENTS_TOPIC", "raw_payment_events")
+def insert_outbox_event(cursor, event):
+    # Convert ISO timestamp strings to Python datetimes where possible
+    evt_ts = parse_iso_ts(event.get("event_timestamp"))
+    ingest_ts = parse_iso_ts(event.get("ingestion_timestamp"))
+
+    cursor.execute(
+        """
+        INSERT INTO operational.payment_status_history (
+            transaction_id, idempotency_key, intent_id, charge_id, refund_id, chargeback_id,
+            event_type, status, event_timestamp, ingestion_timestamp, source_system, payload
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (transaction_id, idempotency_key, event_type) DO NOTHING
+        """,
+        (
+            event["transaction_id"],
+            event["idempotency_key"],
+            event.get("intent_id"),
+            event.get("charge_id"),
+            event.get("refund_id"),
+            event.get("chargeback_id"),
+            event["event_type"],
+            event["status"],
+            evt_ts,
+            ingest_ts,
+            event.get("source_system"),
+            Json(event),
+        ),
+    )
+    
+def write_event_to_postgres(cursor, event):
+    event_type = event["event_type"]
+    # Ensure referenced user/merchant exist to avoid FK violations
+    ensure_user_and_merchant(cursor, event)
+
+    if event_type in {"payment_intent_created", "payment_intent_authorized", "payment_intent_failed", "settlement_recorded"}:
+        upsert_payment_intent(cursor, event)
+    elif event_type == "capture_succeeded":
+        upsert_charge(cursor, event)
+    elif event_type == "refund_recorded":
+        upsert_refund(cursor, event)
+    elif event_type == "chargeback_received":
+        upsert_chargeback(cursor, event)
+    else:
+        raise ValueError(f"Unknown event_type: {event_type}")
+
+    insert_outbox_event(cursor, event)
+    
+def persist_event_batch(db_pool, raw_events, p_exact=0.05, p_retry=0.02):
+    conn = db_pool.getconn()
+    inserted = 0
+
+    try:
+        with conn:
+            with conn.cursor() as cursor:
+                for raw_event in raw_events:
+                    outbound_events = get_duplicate_events(
+                        raw_event,
+                        p_exact=p_exact,
+                        p_retry=p_retry,
+                    )
+                    for event in outbound_events:
+                        write_event_to_postgres(cursor, event)
+                        inserted += 1
+        return inserted
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
+        
+
+
+def run_postgres_stream():
     p_exact = float(os.getenv("PAYMENT_DUPLICATE_RATE", "0.05"))
     p_retry = float(os.getenv("PAYMENT_RETRY_RATE", "0.02"))
 
-    producer = create_kafka_producer()
-    print(f"Starting Kafka payment stream on topic={topic_name}")
+    db_pool = create_db_pool()
+    print("Starting Postgres payment stream")
 
     try:
         while True:
@@ -239,26 +489,22 @@ def run_kafka_stream():
                     raw_events = [late_event]
 
             if raw_events:
-                published_count = emit_event_batch(
-                    producer,
-                    topic_name,
+                inserted_count = persist_event_batch(
+                    db_pool,
                     raw_events,
                     p_exact=p_exact,
                     p_retry=p_retry,
                 )
-                print(f"published_events={published_count}")
+                print(f"inserted_events={inserted_count}")
 
             time.sleep(random.uniform(0.1, 0.7))
 
     except KeyboardInterrupt:
         print("Stopping producer...")
     finally:
-        producer.flush()
-        print("Producer flushed and stopped.")
-
-
+        db_pool.closeall()
+        print("DB pool closed.")
+        
+        
 if __name__ == "__main__":
-    run_kafka_stream()
-
-
-
+    run_postgres_stream()

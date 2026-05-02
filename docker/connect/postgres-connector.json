@@ -11,7 +11,7 @@
     "topic.prefix": "postgres-db",
     "slot.name": "debezium_slot",
     "publication.name": "dbz_publication",
-    "schema.include.list": "operational",
+    "table.include.list": "operational.payment_status_history",
     "snapshot.mode": "initial",
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
