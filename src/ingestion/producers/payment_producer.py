@@ -406,12 +406,12 @@ def normalize_entity_ids(event):
 
     if event_type.startswith("payment_intent"):
         normalized["intent_id"] = event.get("intent_id")
+    elif event_type.startswith("chargeback"):
+        normalized["chargeback_id"] = event.get("chargeback_id")
     elif event_type.startswith("charge") or event_type.startswith("capture"):
         normalized["charge_id"] = event.get("charge_id")
     elif event_type.startswith("refund"):
         normalized["refund_id"] = event.get("refund_id")
-    elif event_type.startswith("chargeback"):
-        normalized["chargeback_id"] = event.get("chargeback_id")
     elif event_type.startswith("settlement"):
         normalized["intent_id"] = event.get("intent_id")
 
