@@ -391,10 +391,40 @@ def upsert_chargeback(cursor, event):
     )
 
 
+def normalize_entity_ids(event):
+    """
+    Normalize entity IDs based on event_type to satisfy one_entity constraint.
+    Only the primary entity ID for the event is kept non-NULL; others are set to NULL.
+    """
+    event_type = event.get("event_type", "")
+    normalized = {
+        "intent_id": None,
+        "charge_id": None,
+        "refund_id": None,
+        "chargeback_id": None,
+    }
+
+    if event_type.startswith("payment_intent"):
+        normalized["intent_id"] = event.get("intent_id")
+    elif event_type.startswith("charge") or event_type.startswith("capture"):
+        normalized["charge_id"] = event.get("charge_id")
+    elif event_type.startswith("refund"):
+        normalized["refund_id"] = event.get("refund_id")
+    elif event_type.startswith("chargeback"):
+        normalized["chargeback_id"] = event.get("chargeback_id")
+    elif event_type.startswith("settlement"):
+        normalized["intent_id"] = event.get("intent_id")
+
+    return normalized
+
+
 def insert_outbox_event(cursor, event):
     # Convert ISO timestamp strings to Python datetimes where possible
     evt_ts = parse_iso_ts(event.get("event_timestamp"))
     ingest_ts = parse_iso_ts(event.get("ingestion_timestamp"))
+
+    # Normalize entity IDs to satisfy one_entity constraint
+    entity_ids = normalize_entity_ids(event)
 
     cursor.execute(
         """
@@ -408,10 +438,10 @@ def insert_outbox_event(cursor, event):
         (
             event["transaction_id"],
             event["idempotency_key"],
-            event.get("intent_id"),
-            event.get("charge_id"),
-            event.get("refund_id"),
-            event.get("chargeback_id"),
+            entity_ids["intent_id"],
+            entity_ids["charge_id"],
+            entity_ids["refund_id"],
+            entity_ids["chargeback_id"],
             event["event_type"],
             event["status"],
             evt_ts,
