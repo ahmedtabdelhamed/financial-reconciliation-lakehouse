@@ -1,6 +1,4 @@
-import os
 from dotenv import load_dotenv
-load_dotenv()
 
 from src.ingestion.producers.payment_producer import (
     create_db_pool,
@@ -8,10 +6,9 @@ from src.ingestion.producers.payment_producer import (
     persist_event_batch,
 )
 
-import psycopg2
-
 
 def run_one_shot():
+    load_dotenv()
     db_pool = create_db_pool()
     raw_events = generate_initial_checkout()
     print(f"Generated {len(raw_events)} raw events, transaction_id={raw_events[0]['transaction_id']}")
