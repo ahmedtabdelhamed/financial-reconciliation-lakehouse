@@ -158,7 +158,7 @@ services:
     command:
       - -c
       - |
-        /usr/bin/mc config host add minio http://minio:9000 minioadmin minioadmin &&
+        /usr/bin/mc config host add minio http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" &&
         /usr/bin/mc mb --ignore-existing minio/lakehouse-bronze &&
         /usr/bin/mc mb --ignore-existing minio/lakehouse-silver &&
         /usr/bin/mc mb --ignore-existing minio/lakehouse-gold &&
@@ -167,7 +167,7 @@ services:
 
   spark-master:
     image: bitnamilegacy/spark:3.5.1
-    container_name: spark-master
+    container_name: lakehouse-spark-master
     restart: unless-stopped
     networks:
       - lakehouse_net
@@ -193,7 +193,7 @@ services:
       SPARK_SSL_ENABLED: "no"
     
     volumes:
-      - ./src:/opt/bitnami/spark/src
+      - ../src:/opt/bitnami/spark/src
       - ./conf/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
 
     healthcheck:
@@ -206,7 +206,7 @@ services:
 
   spark-worker:
     image: bitnamilegacy/spark:3.5.1
-    container_name: spark-worker
+    container_name: lakehouse-spark-worker
     restart: unless-stopped
     ports:
       - 8081:8081
@@ -216,7 +216,7 @@ services:
         condition: service_healthy
 
     volumes: 
-      - ./src:/opt/bitnami/spark/src
+      - ../src:/opt/bitnami/spark/src
       - ./conf/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
 
     networks:
